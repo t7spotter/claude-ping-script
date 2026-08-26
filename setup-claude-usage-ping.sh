@@ -38,7 +38,7 @@ case "$SELF" in
 esac
 
 # ------------------------------------------------------------------ defaults ---
-SCHEDULE="0 */5 * * *"
+SCHEDULE="0 0,5,9,14,19 * * *"
 MODEL="haiku"
 PROMPT="Hi"
 SCRIPT_PATH=""
