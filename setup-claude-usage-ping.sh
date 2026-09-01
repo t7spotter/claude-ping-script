@@ -6,16 +6,20 @@
 # checks the current active block via ccusage and, only if that block shows
 # zero tokens, sends a minimal prompt to start the window.
 #
+# Each run picks a random prompt from a configurable list and sends it to the
+# SAME conversation, resuming by session id so the pings accumulate in one
+# thread instead of scattering across a new session every time.
+#
 # The point of this installer is that it DETECTS the environment instead of
 # assuming it. Every path baked into the generated script is discovered on
 # the target machine, then verified under a stripped environment (env -i)
 # that reproduces cron's conditions.
 #
 # Install:
-#   curl -fsSL https://raw.githubusercontent.com/USER/REPO/v1.0.1/setup-claude-usage-ping.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/USER/REPO/v1.1.0/setup-claude-usage-ping.sh | bash
 #
 # Or, preferably, download and read it first:
-#   curl -fsSL -o setup.sh https://raw.githubusercontent.com/USER/REPO/v1.0.1/setup-claude-usage-ping.sh
+#   curl -fsSL -o setup.sh https://raw.githubusercontent.com/USER/REPO/v1.1.0/setup-claude-usage-ping.sh
 #   less setup.sh && bash setup.sh --dry-run && bash setup.sh
 #
 # Requires: bash 4+, cron, node/npm, and an already-authenticated claude CLI.
@@ -26,7 +30,7 @@
 #
 set -euo pipefail
 
-VERSION="1.0.1"
+VERSION="1.1.0"
 MARKER="# === claude-usage-ping (managed by setup-claude-usage-ping.sh) ==="
 
 # Under `curl | bash`, $0 is "bash" (or a /dev/fd path). Fall back to the
@@ -40,7 +44,21 @@ esac
 # ------------------------------------------------------------------ defaults ---
 SCHEDULE="0 0,5,9,14,19 * * *"
 MODEL="haiku"
-PROMPT="Hi"
+
+# One of these is chosen at random on every run. Keep them short: each ping
+# is billed, and every resumed run replays the conversation so far.
+DEFAULT_PROMPTS=(
+  "Hi"
+  "Hello"
+  "Hey"
+  "Ping"
+  "Howdy"
+  "Good day"
+  "Still there?"
+  "Checking in"
+)
+PROMPTS=()          # populated by --prompt; falls back to DEFAULT_PROMPTS
+
 SCRIPT_PATH=""
 TARGET_USER="$(id -un)"
 DRY_RUN=0
@@ -48,6 +66,7 @@ DO_CRON=1
 DO_SMOKE=1
 UNINSTALL=0
 ASSUME_YES=0
+NEW_SESSION_FLAG=0
 
 # -------------------------------------------------------------------- output ---
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -76,22 +95,38 @@ usage() {
 setup-claude-usage-ping.sh v$VERSION
 
 Installs a cron job that pings Claude Code only when the current 5-hour
-usage block is idle.
+usage block is idle. Each ping uses a randomly chosen prompt and resumes
+the same conversation.
 
 OPTIONS
   -u, --user USER       Install for USER (default: current user).
                         Must be the user that authenticated the claude CLI.
   -s, --schedule CRON   Cron schedule (default: "$SCHEDULE")
   -m, --model MODEL     Model used for the ping (default: $MODEL)
-  -p, --prompt TEXT     Ping prompt (default: "$PROMPT")
+  -p, --prompt TEXT     Add TEXT to the pool of ping prompts. Repeatable;
+                        one is picked at random per run. If omitted, a
+                        built-in pool of ${#DEFAULT_PROMPTS[@]} short prompts is used.
       --path FILE       Where to write the generated script
                         (default: <home>/claude-usage-ping.sh)
+      --new-session     Forget any stored session id, so the next run opens
+                        a fresh conversation.
       --no-cron         Generate and test the script, but leave crontab alone
       --no-smoke-test   Skip the live end-to-end run (avoids one API call)
       --dry-run         Print planned actions; change nothing
-      --uninstall       Remove the cron entry and the generated script
+      --uninstall       Remove the cron entry, the generated script, and the
+                        stored session id
   -y, --yes             Never prompt for confirmation
   -h, --help            Show this message
+
+SESSION REUSE
+  The first ping starts a conversation; its session id is stored in
+  <home>/.claude/usage-ping-session and passed to 'claude --resume' on every
+  later run. If the resume fails (session pruned, id stale) the script logs a
+  warning, opens a fresh session, and records the new id.
+
+  Because a resumed session replays its whole history, the per-ping cost grows
+  slowly over time. Run with --new-session periodically, or delete the session
+  file, to start the thread over.
 
 PREREQUISITE
   Claude Code must already be authenticated for the target user. Run
@@ -118,8 +153,9 @@ parse_args() {
       -u|--user)       need_val "$@"; TARGET_USER="$2"; shift 2 ;;
       -s|--schedule)   need_val "$@"; SCHEDULE="$2"; shift 2 ;;
       -m|--model)      need_val "$@"; MODEL="$2"; shift 2 ;;
-      -p|--prompt)     need_val "$@"; PROMPT="$2"; shift 2 ;;
+      -p|--prompt)     need_val "$@"; PROMPTS+=("$2"); shift 2 ;;
       --path)          need_val "$@"; SCRIPT_PATH="$2"; shift 2 ;;
+      --new-session)   NEW_SESSION_FLAG=1; shift ;;
       --no-cron)       DO_CRON=0; shift ;;
       --no-smoke-test) DO_SMOKE=0; shift ;;
       --dry-run)       DRY_RUN=1; shift ;;
@@ -129,6 +165,11 @@ parse_args() {
       *)               die "Unknown option: $1 (try --help)" ;;
     esac
   done
+
+  # No --prompt given? Use the built-in pool.
+  if [ "${#PROMPTS[@]}" -eq 0 ]; then
+    PROMPTS=("${DEFAULT_PROMPTS[@]}")
+  fi
 }
 
 # ------------------------------------------------------------ binary lookup ---
@@ -210,6 +251,13 @@ do_uninstall() {
     info "No script at $SCRIPT_PATH"
   fi
 
+  if [ -f "$SESSION_FILE" ]; then
+    run rm -f "$SESSION_FILE"
+    ok "Removed stored session id ($SESSION_FILE)"
+  else
+    info "No stored session id at $SESSION_FILE"
+  fi
+
   info "Log left in place: $LOG_FILE"
   echo
 }
@@ -221,6 +269,11 @@ write_script() {
   TMP_SCRIPT="$(mktemp)"
   trap 'rm -f "${TMP_SCRIPT:-}"' EXIT
 
+  # Shell-quote every prompt now, so arbitrary text (quotes, spaces, $) lands
+  # in the generated array as an inert literal.
+  local p quoted_prompts
+  quoted_prompts="$(for p in "${PROMPTS[@]}"; do printf '  %q\n' "$p"; done)"
+
   # Config block: expanded now, so detected paths are baked in literally.
   cat > "$TMP_SCRIPT" <<CONFIG
 #!/usr/bin/env bash
@@ -230,7 +283,9 @@ write_script() {
 # on $(date '+%Y-%m-%d %H:%M:%S') for user $TARGET_USER
 #
 # Checks the active Claude Code 5-hour block and sends a minimal prompt only
-# if that block is idle. Every path below was detected at install time --
+# if that block is idle. The prompt is drawn at random from PROMPTS below and
+# sent to the session recorded in SESSION_FILE, so every ping lands in one
+# ongoing conversation. Every path below was detected at install time --
 # re-run the installer after upgrading node, ccusage, or the claude CLI.
 #
 set -euo pipefail
@@ -243,8 +298,14 @@ CCUSAGE_BIN="$CCUSAGE_BIN"
 JQ_BIN="$JQ_BIN"
 
 MODEL="$MODEL"
-PROMPT="$PROMPT"
+
+# One is picked at random per run.
+PROMPTS=(
+$quoted_prompts
+)
+
 LOG_FILE="\$HOME/.claude/usage-ping.log"
+SESSION_FILE="\$HOME/.claude/usage-ping-session"
 MAX_LOG_BYTES=1048576
 
 TOKEN_EXPR='$TOKEN_EXPR'
@@ -252,6 +313,11 @@ CONFIG
 
   # Body: quoted heredoc, so nothing expands at generation time.
   cat >> "$TMP_SCRIPT" <<'BODY'
+
+# claude resolves --resume ids against the project directory derived from the
+# working directory. cron's cwd is not guaranteed, so pin it: a run started
+# from elsewhere would fail to find the session and silently fork a new one.
+cd "$HOME" || exit 1
 
 mkdir -p "$(dirname "$LOG_FILE")"
 
@@ -284,6 +350,11 @@ for _bin in "$CCUSAGE_BIN" "$CLAUDE_BIN" "$JQ_BIN"; do
   fi
 done
 
+if [ "${#PROMPTS[@]}" -eq 0 ]; then
+  log "FATAL: PROMPTS is empty - re-run the installer"
+  exit 1
+fi
+
 USAGE_JSON="$("$CCUSAGE_BIN" blocks --active --json 2>>"$LOG_FILE" || echo '{}')"
 
 TOKENS_USED="$(printf '%s' "$USAGE_JSON" \
@@ -301,23 +372,64 @@ esac
 
 log "Active-block tokens: $TOKENS_USED"
 
-if [ "$TOKENS_USED" -eq 0 ]; then
-  log "Block idle - sending ping"
-  if PING_OUTPUT="$("$CLAUDE_BIN" -p "$PROMPT" --model "$MODEL" --output-format json 2>>"$LOG_FILE")"; then
-    SESSION="$(printf '%s' "$PING_OUTPUT" \
-      | "$JQ_BIN" -r '.session_id // "unknown"' 2>/dev/null || echo unknown)"
-    log "Ping OK (session: $SESSION)"
+if [ "$TOKENS_USED" -ne 0 ]; then
+  log "Already active ($TOKENS_USED tokens) - skipping ping"
+  exit 0
+fi
+
+# $RANDOM is uniform enough for picking a greeting; it needs no seeding.
+PROMPT="${PROMPTS[RANDOM % ${#PROMPTS[@]}]}"
+
+# A stored id from a previous run; empty on the very first one.
+SESSION_ID=""
+if [ -s "$SESSION_FILE" ]; then
+  SESSION_ID="$(tr -d '[:space:]' < "$SESSION_FILE")"
+fi
+
+send_ping() {  # send_ping [SESSION_ID] -> response JSON on stdout
+  if [ -n "${1:-}" ]; then
+    "$CLAUDE_BIN" -p "$PROMPT" --model "$MODEL" --output-format json --resume "$1"
   else
+    "$CLAUDE_BIN" -p "$PROMPT" --model "$MODEL" --output-format json
+  fi
+}
+
+PING_OUTPUT=""
+
+if [ -n "$SESSION_ID" ]; then
+  log "Block idle - resuming session $SESSION_ID (prompt: $PROMPT)"
+  if ! PING_OUTPUT="$(send_ping "$SESSION_ID" 2>>"$LOG_FILE")"; then
+    # A pruned or otherwise stale id must not wedge the job forever.
+    log "WARN: resume of $SESSION_ID failed - falling back to a new session"
+    SESSION_ID=""
+  fi
+else
+  log "Block idle - starting a new session (prompt: $PROMPT)"
+fi
+
+if [ -z "$SESSION_ID" ]; then
+  if ! PING_OUTPUT="$(send_ping "" 2>>"$LOG_FILE")"; then
     log "Ping FAILED: $PING_OUTPUT"
     exit 1
   fi
+fi
+
+RETURNED_SESSION="$(printf '%s' "$PING_OUTPUT" \
+  | "$JQ_BIN" -r '.session_id // empty' 2>/dev/null || true)"
+
+if [ -n "$RETURNED_SESSION" ]; then
+  # Write back unconditionally: some versions hand out a new id on resume.
+  printf '%s\n' "$RETURNED_SESSION" > "$SESSION_FILE"
+  chmod 600 "$SESSION_FILE" 2>/dev/null || true
+  log "Ping OK (session: $RETURNED_SESSION)"
 else
-  log "Already active ($TOKENS_USED tokens) - skipping ping"
+  log "WARN: ping OK but no session_id in the response - next run starts fresh"
 fi
 BODY
 
   if [ "$DRY_RUN" -eq 1 ]; then
     info "[dry-run] would write $SCRIPT_PATH ($(wc -l < "$TMP_SCRIPT") lines)"
+    info "[dry-run] prompt pool (${#PROMPTS[@]}): ${PROMPTS[*]}"
     return 0
   fi
 
@@ -325,6 +437,7 @@ BODY
   install -m 700 -o "$TARGET_USER" "$TMP_SCRIPT" "$SCRIPT_PATH" 2>/dev/null \
     || { cp "$TMP_SCRIPT" "$SCRIPT_PATH"; chmod 700 "$SCRIPT_PATH"; }
   ok "Written and syntax-checked ($(wc -l < "$SCRIPT_PATH") lines)"
+  ok "Prompt pool (${#PROMPTS[@]}): ${PROMPTS[*]}"
 }
 
 # ---------------------------------------------------------------- smoke test ---
@@ -351,6 +464,12 @@ smoke_test() {
   info "Last log lines:"
   tail -n 5 "$LOG_FILE" 2>/dev/null | sed 's/^/      /' || info "(log empty)"
   echo
+
+  if [ -s "$SESSION_FILE" ]; then
+    ok "Session id recorded: $(cat "$SESSION_FILE")"
+  else
+    info "No session id recorded yet (block was already active, or the ping was skipped)"
+  fi
 
   if tail -n 5 "$LOG_FILE" 2>/dev/null \
      | grep -qE 'command not found|FATAL|Ping FAILED'; then
@@ -429,6 +548,7 @@ main() {
 
   [ -z "$SCRIPT_PATH" ] && SCRIPT_PATH="$TARGET_HOME/claude-usage-ping.sh"
   LOG_FILE="$TARGET_HOME/.claude/usage-ping.log"
+  SESSION_FILE="$TARGET_HOME/.claude/usage-ping-session"
 
   AS_TARGET=()
   if [ "$TARGET_USER" != "$(id -un)" ]; then
@@ -445,6 +565,17 @@ main() {
   if [ "$UNINSTALL" -eq 1 ]; then
     do_uninstall
     exit 0
+  fi
+
+  # Reinstalling should not silently inherit an old thread if asked otherwise.
+  if [ "$NEW_SESSION_FLAG" -eq 1 ]; then
+    step "Resetting session"
+    if [ -f "$SESSION_FILE" ]; then
+      run rm -f "$SESSION_FILE"
+      ok "Cleared $SESSION_FILE -- the next ping opens a fresh conversation"
+    else
+      info "No session id stored; the next ping starts fresh anyway"
+    fi
   fi
 
   # -- detect binaries ------------------------------------------------------
@@ -572,14 +703,22 @@ main() {
   cat <<SUMMARY
   Script    $SCRIPT_PATH
   Log       $LOG_FILE
+  Session   $SESSION_FILE
   Schedule  $SCHEDULE
   User      $TARGET_USER
+  Prompts   ${#PROMPTS[@]} (random pick per run): ${PROMPTS[*]}
   PATH      $PINNED_PATH
 
   Verify the next scheduled run:
     tail -f $LOG_FILE
     crontab -l -u $TARGET_USER
     grep CRON /var/log/syslog | tail -5      # or: journalctl -u cron -n 20
+
+  Every ping resumes the session id in $SESSION_FILE. To start a fresh
+  conversation (worth doing occasionally -- a resumed session replays its
+  whole history, so the per-ping cost creeps up):
+    rm -f $SESSION_FILE
+    # or: $SELF --new-session --no-cron --no-smoke-test
 
   Re-run this installer after upgrading node, ccusage, or the claude CLI.
   The absolute paths baked into the script will not follow a version bump.
