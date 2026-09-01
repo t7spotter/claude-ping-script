@@ -10,16 +10,20 @@
 # SAME conversation, resuming by session id so the pings accumulate in one
 # thread instead of scattering across a new session every time.
 #
+# Re-running is the supported way to upgrade: the generated script is rewritten
+# with freshly detected paths, while the stored session id, the prompt pool, the
+# model and the cron schedule are read back off the existing install and kept.
+#
 # The point of this installer is that it DETECTS the environment instead of
 # assuming it. Every path baked into the generated script is discovered on
 # the target machine, then verified under a stripped environment (env -i)
 # that reproduces cron's conditions.
 #
 # Install:
-#   curl -fsSL https://raw.githubusercontent.com/USER/REPO/v1.1.0/setup-claude-usage-ping.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/USER/REPO/v1.2.0/setup-claude-usage-ping.sh | bash
 #
 # Or, preferably, download and read it first:
-#   curl -fsSL -o setup.sh https://raw.githubusercontent.com/USER/REPO/v1.1.0/setup-claude-usage-ping.sh
+#   curl -fsSL -o setup.sh https://raw.githubusercontent.com/USER/REPO/v1.2.0/setup-claude-usage-ping.sh
 #   less setup.sh && bash setup.sh --dry-run && bash setup.sh
 #
 # Requires: bash 4+, cron, node/npm, and an already-authenticated claude CLI.
@@ -30,7 +34,7 @@
 #
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 MARKER="# === claude-usage-ping (managed by setup-claude-usage-ping.sh) ==="
 
 # Under `curl | bash`, $0 is "bash" (or a /dev/fd path). Fall back to the
@@ -44,6 +48,12 @@ esac
 # ------------------------------------------------------------------ defaults ---
 SCHEDULE="0 0,5,9,14,19 * * *"
 MODEL="haiku"
+
+# Whether the user named these explicitly. An existing install only supplies a
+# value for the ones they did not, so a flag always beats a carried-over value.
+SCHEDULE_SET=0
+MODEL_SET=0
+IGNORE_EXISTING=0
 
 # One of these is chosen at random on every run. Keep them short: each ping
 # is billed, and every resumed run replays the conversation so far.
@@ -110,6 +120,8 @@ OPTIONS
                         (default: <home>/claude-usage-ping.sh)
       --new-session     Forget any stored session id, so the next run opens
                         a fresh conversation.
+      --defaults        Ignore the existing install's settings and fall back
+                        to this script's built-in defaults.
       --no-cron         Generate and test the script, but leave crontab alone
       --no-smoke-test   Skip the live end-to-end run (avoids one API call)
       --dry-run         Print planned actions; change nothing
@@ -117,6 +129,14 @@ OPTIONS
                         stored session id
   -y, --yes             Never prompt for confirmation
   -h, --help            Show this message
+
+RE-RUNNING
+  Re-run this installer to pick up new binary paths after upgrading node,
+  ccusage, or the claude CLI. Settings are carried over from the install it
+  finds -- schedule (read from the crontab), prompt pool and model -- so a bare
+  re-run is a safe in-place upgrade. Any flag you pass overrides the carried
+  value; --defaults discards all of them. The stored session id is never
+  touched except by --new-session or --uninstall.
 
 SESSION REUSE
   The first ping starts a conversation; its session id is stored in
@@ -151,11 +171,12 @@ parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
       -u|--user)       need_val "$@"; TARGET_USER="$2"; shift 2 ;;
-      -s|--schedule)   need_val "$@"; SCHEDULE="$2"; shift 2 ;;
-      -m|--model)      need_val "$@"; MODEL="$2"; shift 2 ;;
+      -s|--schedule)   need_val "$@"; SCHEDULE="$2"; SCHEDULE_SET=1; shift 2 ;;
+      -m|--model)      need_val "$@"; MODEL="$2"; MODEL_SET=1; shift 2 ;;
       -p|--prompt)     need_val "$@"; PROMPTS+=("$2"); shift 2 ;;
       --path)          need_val "$@"; SCRIPT_PATH="$2"; shift 2 ;;
       --new-session)   NEW_SESSION_FLAG=1; shift ;;
+      --defaults)      IGNORE_EXISTING=1; shift ;;
       --no-cron)       DO_CRON=0; shift ;;
       --no-smoke-test) DO_SMOKE=0; shift ;;
       --dry-run)       DRY_RUN=1; shift ;;
@@ -165,11 +186,6 @@ parse_args() {
       *)               die "Unknown option: $1 (try --help)" ;;
     esac
   done
-
-  # No --prompt given? Use the built-in pool.
-  if [ "${#PROMPTS[@]}" -eq 0 ]; then
-    PROMPTS=("${DEFAULT_PROMPTS[@]}")
-  fi
 }
 
 # ------------------------------------------------------------ binary lookup ---
@@ -223,6 +239,86 @@ path_add() {  # append $1 to PIN_DIRS if not already present
     *":$d:"*) ;;
     *) PIN_DIRS+=("$d") ;;
   esac
+  return 0
+}
+
+# -------------------------------------------------------- settings carry-over ---
+# A re-run exists to refresh detected paths, not to silently reset the user's
+# configuration. Read back whatever the previous install chose and use it for
+# every option the caller did not name explicitly.
+carry_over_config() {
+  if [ "$IGNORE_EXISTING" -eq 1 ]; then
+    step "Reusing settings from the existing install"
+    info "Skipped (--defaults): using built-in defaults"
+    return 0
+  fi
+  [ -f "$SCRIPT_PATH" ] || return 0
+
+  step "Reusing settings from the existing install"
+
+  local prev_ver
+  prev_ver="$(sed -n 's/^# Generated by setup-claude-usage-ping\.sh v\(.*\)$/\1/p' \
+    "$SCRIPT_PATH" 2>/dev/null | head -1 || true)"
+  [ -n "$prev_ver" ] && info "Found a script generated by v$prev_ver"
+
+  # -- model ----------------------------------------------------------------
+  if [ "$MODEL_SET" -eq 0 ]; then
+    local m
+    m="$(sed -n 's/^MODEL="\(.*\)"$/\1/p' "$SCRIPT_PATH" 2>/dev/null | head -1 || true)"
+    if [ -n "$m" ] && [ "$m" != "$MODEL" ]; then
+      MODEL="$m"
+      ok "model:    $MODEL (kept)"
+    fi
+  fi
+
+  # -- prompt pool ----------------------------------------------------------
+  if [ "${#PROMPTS[@]}" -eq 0 ]; then
+    local block
+    block="$(sed -n '/^PROMPTS=(/,/^)/p' "$SCRIPT_PATH" 2>/dev/null || true)"
+    if [ -n "$block" ]; then
+      # These values were written by printf %q in a previous run of this same
+      # installer, so re-reading them with eval round-trips exactly. The file
+      # is mode 700 and owned by the target user.
+      local -a old_prompts=()
+      if eval "old_prompts=( $(printf '%s' "$block" | sed -e '1d' -e '$d') )" 2>/dev/null \
+         && [ "${#old_prompts[@]}" -gt 0 ]; then
+        PROMPTS=("${old_prompts[@]}")
+        ok "prompts:  ${#PROMPTS[@]} kept: ${PROMPTS[*]}"
+      else
+        warn "Could not parse the existing PROMPTS array -- using defaults"
+      fi
+    elif grep -q '^PROMPT="' "$SCRIPT_PATH" 2>/dev/null; then
+      # Pre-1.1.0 single-prompt layout. Carrying that one string over would
+      # defeat the upgrade, so take the pool and say so.
+      info "Old single-prompt install -- switching to the random pool"
+      info "Pass -p to pin your own prompts instead"
+    fi
+  fi
+
+  # -- schedule, read from the live crontab ---------------------------------
+  if [ "$SCHEDULE_SET" -eq 0 ] && command -v crontab >/dev/null 2>&1; then
+    local line sched f1 f2 f3 f4 f5 rest
+    line="$("${AS_TARGET[@]}" crontab -l 2>/dev/null \
+      | grep -F "$SCRIPT_PATH" | grep -v '^[[:space:]]*#' | head -1 || true)"
+    if [ -n "$line" ]; then
+      # Split in the shell rather than awk: no nested-quoting hazard, and it
+      # handles both the 5-field form and @daily-style nicknames.
+      case "$line" in
+        @*) sched="${line%%[[:space:]]*}" ;;
+        *)  read -r f1 f2 f3 f4 f5 rest <<<"$line"
+            sched="$f1 $f2 $f3 $f4 $f5" ;;
+      esac
+      if [ -n "$sched" ] && [ "$sched" != "$SCHEDULE" ]; then
+        SCHEDULE="$sched"
+        ok "schedule: $SCHEDULE (kept from crontab)"
+      fi
+    fi
+  fi
+
+  # -- session --------------------------------------------------------------
+  if [ -s "$SESSION_FILE" ]; then
+    ok "session:  $(cat "$SESSION_FILE") (kept -- the conversation continues)"
+  fi
   return 0
 }
 
@@ -578,6 +674,13 @@ main() {
     fi
   fi
 
+  carry_over_config
+
+  # Anything still unset falls back to the built-in pool.
+  if [ "${#PROMPTS[@]}" -eq 0 ]; then
+    PROMPTS=("${DEFAULT_PROMPTS[@]}")
+  fi
+
   # -- detect binaries ------------------------------------------------------
   # This is the step the hand-written version got wrong: it hardcoded
   # /usr/local/bin, which cron then could not resolve.
@@ -722,6 +825,8 @@ main() {
 
   Re-run this installer after upgrading node, ccusage, or the claude CLI.
   The absolute paths baked into the script will not follow a version bump.
+  A bare re-run keeps the schedule, prompts, model and session above;
+  pass --defaults to discard them.
 
   Remove everything:
     $SELF --user $TARGET_USER --uninstall
